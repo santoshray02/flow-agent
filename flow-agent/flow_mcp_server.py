@@ -241,6 +241,12 @@ def handle_tools_list(request_id):
                         "type": "string",
                         "description": "Image model to use (harbor_seal/lite, narwhal/standard, gem_pix_2/pro)",
                         "default": "gem_pix_2"
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 4294967295,
+                        "description": "Explicit seed. Reuse it to reproduce a look; omit for a fresh random image. Multi-image requests offset from this value."
                     }
                 },
                 "required": ["prompt"]
@@ -248,7 +254,7 @@ def handle_tools_list(request_id):
         },
         {
             "name": "generate_flow_video",
-            "description": "Generate 1-20 Flow videos with duration, aspect, start asset, and reference-media control.",
+            "description": "Generate 1-20 Flow videos with duration, aspect, start asset, seed, first-last frame, and reference-media control.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -274,6 +280,24 @@ def handle_tools_list(request_id):
                         "items": {"type": "string"},
                         "maxItems": 10,
                         "description": "Optional Flow reference-media IDs for reference-to-video"
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 4294967295,
+                        "description": "Explicit seed. Reuse it to re-roll a shot while holding its look; omit for a fresh random take. Multi-take requests offset from this value."
+                    },
+                    "end_image_path": {
+                        "type": "string",
+                        "description": "Optional local end-frame image. With a start image this switches to first-last frame mode: the clip morphs from start to end."
+                    },
+                    "end_media_id": {
+                        "type": "string",
+                        "description": "Optional pre-uploaded end-frame media ID; same first-last frame mode as end_image_path"
+                    },
+                    "video_model": {
+                        "type": "string",
+                        "description": "Override the Flow videoModelKey (defaults to abra_t2v_<duration>s)"
                     }
                 },
                 "required": ["prompt"]
@@ -393,7 +417,8 @@ def call_upload_flow_media(file_path):
         return {"error": f"Upload failed: {str(e)}"}
 
 def call_generate_flow_image(prompt, size="1280x720", count=1, ref_image_path=None,
-                             ref_image_paths=None, ref_media_ids=None, model=None):
+                             ref_image_paths=None, ref_media_ids=None, model=None,
+                             seed=None):
     if not prompt or not str(prompt).strip():
         return "Error: 'prompt' is required and cannot be empty.", None
     prompt = str(prompt).strip()
@@ -407,6 +432,8 @@ def call_generate_flow_image(prompt, size="1280x720", count=1, ref_image_path=No
         "response_format": "b64_json"
     }
     payload["model"] = _normalise_model(model)
+    if seed is not None:
+        payload["seed"] = int(seed)
 
     media_ids = list(ref_media_ids or [])
     local_refs = list(ref_image_paths or [])
@@ -465,7 +492,8 @@ def call_generate_flow_image(prompt, size="1280x720", count=1, ref_image_path=No
         return f"Failed to communicate with Flow Agent server: {str(e)}", []
 
 def call_generate_flow_video(prompt, aspect="landscape", start_image_path=None, duration=8,
-                             count=1, start_media_id=None, ref_media_ids=None, is_video=False):
+                             count=1, start_media_id=None, ref_media_ids=None, is_video=False,
+                             seed=None, end_image_path=None, end_media_id=None, video_model=None):
     if not prompt or not str(prompt).strip():
         return "Error: 'prompt' is required and cannot be empty."
     prompt = str(prompt).strip()
@@ -481,6 +509,13 @@ def call_generate_flow_video(prompt, aspect="landscape", start_image_path=None, 
     if ref_media_ids:
         payload["ref_media_ids"] = list(ref_media_ids)[:10]
 
+    if seed is not None:
+        payload["seed"] = int(seed)
+    if video_model:
+        payload["video_model"] = video_model
+    if end_media_id:
+        payload["end_media_id"] = end_media_id
+
     if start_image_path:
         if not os.path.exists(start_image_path):
             return f"Error: Starting image path does not exist: {start_image_path}"
@@ -488,6 +523,14 @@ def call_generate_flow_video(prompt, aspect="landscape", start_image_path=None, 
             payload["image_base64"] = _file_data_uri(start_image_path)
         except Exception as e:
             return f"Error reading starting image: {str(e)}"
+
+    if end_image_path:
+        if not os.path.exists(end_image_path):
+            return f"Error: End image path does not exist: {end_image_path}"
+        try:
+            payload["end_image_base64"] = _file_data_uri(end_image_path)
+        except Exception as e:
+            return f"Error reading end image: {str(e)}"
 
     try:
         log_debug(f"Sending video generation request for prompt: {prompt}")
@@ -624,7 +667,8 @@ def handle_tool_call(request_id, tool_name, arguments):
         ref_media_ids = arguments.get("ref_media_ids")
         model = arguments.get("model")
         text, images_b64 = call_generate_flow_image(
-            prompt, size, count, ref_image_path, ref_image_paths, ref_media_ids, model
+            prompt, size, count, ref_image_path, ref_image_paths, ref_media_ids, model,
+            arguments.get("seed"),
         )
         content = [{"type": "text", "text": text}]
         for image_data_b64 in images_b64:
@@ -645,6 +689,11 @@ def handle_tool_call(request_id, tool_name, arguments):
             arguments.get("count", 1),
             arguments.get("start_media_id"),
             arguments.get("ref_media_ids"),
+            arguments.get("is_video", False),
+            arguments.get("seed"),
+            arguments.get("end_image_path"),
+            arguments.get("end_media_id"),
+            arguments.get("video_model"),
         )
         content = [{"type": "text", "text": text}]
     elif tool_name == "upload_flow_media":
