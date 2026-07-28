@@ -8,6 +8,7 @@ import urllib.error
 import mimetypes
 import tempfile
 import shutil
+import uuid
 from urllib.parse import urlparse, unquote
 
 # Load .env so MCP sees the same user settings as the backend. Legacy
@@ -301,6 +302,73 @@ def handle_tools_list(request_id):
                     }
                 },
                 "required": ["prompt"]
+            }
+        },
+        {
+            "name": "generate_flow_sequence",
+            "description": "Generate a continuity-chained run of shots: each shot starts on the previous shot's final frame, so cuts land on matching pixels. Returns clip paths in order. Requires FFmpeg.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "shots": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 60,
+                        "description": "Ordered shots. Each item is either a prompt string or {prompt, duration, end_image_path}.",
+                        "items": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "prompt": {"type": "string"},
+                                        "duration": {"type": "integer", "enum": [4, 6, 8, 10]},
+                                        "end_image_path": {"type": "string"}
+                                    },
+                                    "required": ["prompt"]
+                                }
+                            ]
+                        }
+                    },
+                    "aspect": {"type": "string", "enum": ["landscape", "portrait"], "default": "landscape"},
+                    "duration": {"type": "integer", "enum": [4, 6, 8, 10], "default": 8, "description": "Default duration for shots that don't set their own"},
+                    "start_image_path": {"type": "string", "description": "Optional opening frame for shot 1; later shots chain automatically"},
+                    "output_dir": {"type": "string", "description": "Where clips are written; defaults to ~/Downloads/Flow-Agent"},
+                    "seed": {"type": "integer", "minimum": 0, "maximum": 4294967295, "description": "Base seed; each shot offsets from it"},
+                    "video_model": {"type": "string", "description": "Override the Flow videoModelKey"},
+                    "ref_media_ids": {
+                        "type": "array", "items": {"type": "string"}, "maxItems": 10,
+                        "description": "Reference media applied to every shot, for style or character carry-through"
+                    }
+                },
+                "required": ["shots"]
+            }
+        },
+        {
+            "name": "extract_video_frame",
+            "description": "Extract one frame from a local video as a PNG. Use the last frame of a clip as the start image of the next to chain shots manually. Requires FFmpeg.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "video_path": {"type": "string", "description": "Local video file"},
+                    "position": {"type": "string", "default": "last", "description": "'first', 'last', or a frame index like '48'"},
+                    "output_path": {"type": "string", "description": "Optional PNG destination"}
+                },
+                "required": ["video_path"]
+            }
+        },
+        {
+            "name": "concat_flow_videos",
+            "description": "Concatenate local clips in order into one MP4, optionally replacing audio with a single narration track. Requires FFmpeg.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "video_paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Clips in playback order"},
+                    "output_path": {"type": "string", "description": "Destination MP4"},
+                    "audio_path": {"type": "string", "description": "Optional audio track replacing per-clip audio (e.g. one narration voice)"},
+                    "mute_source": {"type": "boolean", "default": False, "description": "Drop source audio when no audio_path is given"}
+                },
+                "required": ["video_paths", "output_path"]
             }
         },
         {
@@ -646,6 +714,222 @@ def call_download_media_from_url(url, output_dir=None, filename=None,
             except OSError:
                 pass
 
+# ─── Local media tooling ─────────────────────────────────────
+# Shot-to-shot continuity is built by carrying the last frame of one clip into
+# the next as its start image, so these helpers need frame-accurate local
+# access to the generated files. FFmpeg is optional: only the tools below
+# require it, and they fail with a clear message rather than at import time.
+
+def _require_ffmpeg():
+    missing = [n for n in ("ffmpeg", "ffprobe") if not shutil.which(n)]
+    if missing:
+        return ("Error: %s not found on PATH. Install FFmpeg to use this tool."
+                % " and ".join(missing))
+    return None
+
+
+def _media_dir(output_dir=None):
+    target = output_dir or os.path.join(os.path.expanduser("~"), "Downloads", "Flow-Agent")
+    os.makedirs(target, exist_ok=True)
+    return target
+
+
+def _run(cmd, timeout=180):
+    import subprocess
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+
+
+def call_extract_video_frame(video_path, position="last", output_path=None):
+    """Pull one frame out of a local video. 'position' is first, last, or a frame index."""
+    err = _require_ffmpeg()
+    if err:
+        return {"error": err}
+    if not video_path or not os.path.exists(video_path):
+        return {"error": f"Video not found: {video_path}"}
+
+    if not output_path:
+        base = os.path.splitext(os.path.basename(video_path))[0]
+        output_path = os.path.join(os.path.dirname(video_path), f"{base}_{position}.png")
+
+    pos = str(position).lower()
+    if pos == "last":
+        # Seeking from the end is far cheaper than decoding the whole file, and
+        # -update 1 keeps overwriting so the final decoded frame is what lands.
+        cmd = ["ffmpeg", "-y", "-v", "error", "-sseof", "-0.2", "-i", video_path,
+               "-update", "1", output_path]
+    elif pos == "first":
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", video_path,
+               "-vf", "select=eq(n\\,0)", "-frames:v", "1", output_path]
+    else:
+        try:
+            idx = int(position)
+        except (TypeError, ValueError):
+            return {"error": "position must be 'first', 'last', or a frame index"}
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", video_path,
+               "-vf", f"select=eq(n\\,{idx})", "-frames:v", "1", output_path]
+
+    try:
+        code, _, stderr = _run(cmd)
+    except Exception as e:
+        return {"error": f"Frame extraction failed: {e}"}
+    if code != 0 or not os.path.exists(output_path):
+        return {"error": f"Frame extraction failed: {stderr.strip()[:400]}"}
+    return {"frame_path": output_path}
+
+
+def _post_video_json(payload, timeout=900):
+    """Submit one video generation and return (items, error)."""
+    try:
+        req = urllib.request.Request(
+            f"{FLOW_API_URL}/v1/videos/generations",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            if response.status != 200:
+                return None, f"HTTP {response.status}"
+            return json.loads(response.read().decode("utf-8")).get("data", []), None
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8")
+        except Exception:
+            detail = str(e)
+        return None, f"HTTP {e.code}: {detail[:400]}"
+    except Exception as e:
+        return None, str(e)
+
+
+def call_generate_flow_sequence(shots, aspect="landscape", duration=8, output_dir=None,
+                                start_image_path=None, seed=None, video_model=None,
+                                ref_media_ids=None):
+    """Generate a continuity-chained run of shots.
+
+    Each shot after the first starts on the previous shot's final frame, so cuts
+    land on matching pixels instead of relying on the model to re-imagine the
+    scene. Returns the clip paths in order, ready to concatenate.
+    """
+    err = _require_ffmpeg()
+    if err:
+        return {"error": err}
+    if not shots or not isinstance(shots, list):
+        return {"error": "'shots' must be a non-empty list of prompts or shot objects"}
+
+    target_dir = _media_dir(output_dir)
+    carry_frame = start_image_path
+    if carry_frame and not os.path.exists(carry_frame):
+        return {"error": f"start_image_path does not exist: {carry_frame}"}
+
+    clips, failures = [], []
+    for i, shot in enumerate(shots):
+        if isinstance(shot, dict):
+            prompt = shot.get("prompt")
+            shot_duration = int(shot.get("duration") or duration)
+            end_path = shot.get("end_image_path")
+        else:
+            prompt, shot_duration, end_path = str(shot), int(duration), None
+        if not prompt or not str(prompt).strip():
+            failures.append({"index": i, "error": "empty prompt"})
+            break
+
+        payload = {"prompt": str(prompt).strip(), "aspect": aspect,
+                   "n": 1, "duration": shot_duration}
+        if seed is not None:
+            payload["seed"] = int(seed) + i
+        if video_model:
+            payload["video_model"] = video_model
+        if ref_media_ids:
+            payload["ref_media_ids"] = list(ref_media_ids)[:10]
+        if carry_frame:
+            try:
+                payload["image_base64"] = _file_data_uri(carry_frame)
+            except Exception as e:
+                failures.append({"index": i, "error": f"could not read carry frame: {e}"})
+                break
+        if end_path:
+            if not os.path.exists(end_path):
+                failures.append({"index": i, "error": f"end_image_path missing: {end_path}"})
+                break
+            payload["end_image_base64"] = _file_data_uri(end_path)
+
+        items, gen_err = _post_video_json(payload)
+        if gen_err or not items:
+            failures.append({"index": i, "error": gen_err or "no media returned"})
+            break
+
+        url = items[0].get("url")
+        body = _download_bytes(url, timeout=180) if url else None
+        if not body:
+            failures.append({"index": i, "error": f"download failed for {url}"})
+            break
+        clip_path = os.path.join(target_dir, f"seq_{i + 1:02d}.mp4")
+        with open(clip_path, "wb") as f:
+            f.write(body)
+        clips.append({"index": i, "path": clip_path,
+                      "media_id": items[0].get("media_id"), "prompt": prompt})
+
+        # Carry this clip's final frame into the next shot.
+        if i < len(shots) - 1:
+            extracted = call_extract_video_frame(clip_path, "last",
+                                                 os.path.join(target_dir, f"seq_{i + 1:02d}_last.png"))
+            if extracted.get("error"):
+                failures.append({"index": i, "error": extracted["error"]})
+                break
+            carry_frame = extracted["frame_path"]
+
+    return {"clips": clips, "generated": len(clips), "requested": len(shots),
+            "failures": failures, "output_dir": target_dir}
+
+
+def call_concat_flow_videos(video_paths, output_path, audio_path=None, mute_source=False):
+    """Concatenate clips in order, optionally replacing audio with one track."""
+    err = _require_ffmpeg()
+    if err:
+        return {"error": err}
+    if not video_paths or not isinstance(video_paths, list) or len(video_paths) < 1:
+        return {"error": "'video_paths' must be a non-empty list"}
+    missing = [p for p in video_paths if not os.path.exists(p)]
+    if missing:
+        return {"error": f"Missing input files: {missing[:5]}"}
+    if not output_path:
+        return {"error": "'output_path' is required"}
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+    list_file = os.path.join(_media_dir(), f"concat_{uuid.uuid4().hex[:8]}.txt")
+    try:
+        with open(list_file, "w", encoding="utf-8") as f:
+            for p in video_paths:
+                f.write("file '%s'\n" % os.path.abspath(p).replace("\\", "/").replace("'", "'\\''"))
+
+        # Re-encode rather than stream-copy: clips can differ in SAR/timebase and
+        # a copy-concat would silently desync or refuse.
+        cmd = ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", list_file]
+        if audio_path:
+            if not os.path.exists(audio_path):
+                return {"error": f"audio_path does not exist: {audio_path}"}
+            cmd += ["-i", audio_path, "-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+        elif mute_source:
+            cmd += ["-an"]
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "medium"]
+        if audio_path:
+            cmd += ["-c:a", "aac", "-b:a", "192k"]
+        cmd += [output_path]
+
+        code, _, stderr = _run(cmd, timeout=1800)
+        if code != 0 or not os.path.exists(output_path):
+            return {"error": f"Concat failed: {stderr.strip()[:400]}"}
+        size_mb = round(os.path.getsize(output_path) / (1024 * 1024), 2)
+        return {"output_path": output_path, "clips": len(video_paths), "size_mb": size_mb}
+    except Exception as e:
+        return {"error": f"Concat failed: {e}"}
+    finally:
+        try:
+            os.remove(list_file)
+        except Exception:
+            pass
+
+
 def handle_tool_call(request_id, tool_name, arguments):
     log_debug(f"Calling tool: {tool_name} with args: {arguments}")
 
@@ -696,6 +980,33 @@ def handle_tool_call(request_id, tool_name, arguments):
             arguments.get("video_model"),
         )
         content = [{"type": "text", "text": text}]
+    elif tool_name == "generate_flow_sequence":
+        result = call_generate_flow_sequence(
+            arguments.get("shots"),
+            arguments.get("aspect", "landscape"),
+            arguments.get("duration", 8),
+            arguments.get("output_dir"),
+            arguments.get("start_image_path"),
+            arguments.get("seed"),
+            arguments.get("video_model"),
+            arguments.get("ref_media_ids"),
+        )
+        content = [{"type": "text", "text": json.dumps(result, indent=2)}]
+    elif tool_name == "extract_video_frame":
+        result = call_extract_video_frame(
+            arguments.get("video_path"),
+            arguments.get("position", "last"),
+            arguments.get("output_path"),
+        )
+        content = [{"type": "text", "text": json.dumps(result, indent=2)}]
+    elif tool_name == "concat_flow_videos":
+        result = call_concat_flow_videos(
+            arguments.get("video_paths"),
+            arguments.get("output_path"),
+            arguments.get("audio_path"),
+            arguments.get("mute_source", False),
+        )
+        content = [{"type": "text", "text": json.dumps(result, indent=2)}]
     elif tool_name == "upload_flow_media":
         result = call_upload_flow_media(arguments.get("file_path"))
         content = [{"type": "text", "text": json.dumps(result, indent=2)}]
