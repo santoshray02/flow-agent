@@ -153,7 +153,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     // Notify whichever transport is active.
     sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
   },
-  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*'] },
+  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*', 'https://flow.google.com/*'] },
   ['requestHeaders', 'extraHeaders'],
 );
 
@@ -162,7 +162,11 @@ let _openingFlowTab = false;
 // ─── On-demand tab lifecycle ────────────────────────────────
 // Open the Flow tab only when real work needs it (token capture or captcha).
 // Keep it available in the background so user tabs are never redirected.
-const FLOW_TAB_URLS = ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'];
+const FLOW_TAB_URLS = [
+  'https://flow.google.com/*',
+  'https://labs.google/fx/tools/flow*',
+  'https://labs.google/fx/*/tools/flow*',
+];
 const FLOW_URL = 'https://labs.google/fx/tools/flow';
 let workTabId = null;
 let flowTabOpening = null;
@@ -189,7 +193,16 @@ async function closeIdleFlowTab() {
 }
 
 function isFlowUrl(url) {
-  return !!url && FLOW_TAB_URLS.some((p) => new RegExp(p.replace(/\./g, '\\.').replace(/\*/g, '.*')).test(url));
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return false;
+    if (parsed.hostname === 'flow.google.com') return true;
+    if (parsed.hostname !== 'labs.google') return false;
+    return /^\/fx\/(?:[^/]+\/)?tools\/flow(?:\/|$)/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
 }
 
 async function waitForTabComplete(tabId, maxWaitMs = 10000) {
@@ -242,6 +255,8 @@ async function _getOrOpenFlowTab() {
 
   // Inject content script to make sure reCAPTCHA bridge is ready
   try {
+    const readyTab = await chrome.tabs.get(workTabId);
+    if (!isFlowUrl(readyTab?.url)) throw new Error('INVALID_FLOW_TAB');
     await chrome.scripting.executeScript({
       target: { tabId: workTabId },
       files: ['content.js'],
@@ -251,7 +266,7 @@ async function _getOrOpenFlowTab() {
   }
 
   scheduleFlowTabClose();
-  return retryTabs[0];
+  return createdTab;
 }
 
 async function getOrOpenFlowTab() {
@@ -395,9 +410,7 @@ async function connectToAgent() {
           sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
         } else {
           console.log('[Flow Agent] open_flow_tab: token missing/expired, opening tab');
-          const tabs = await chrome.tabs.query({
-            url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-          });
+          const tabs = await chrome.tabs.query({ url: FLOW_TAB_URLS });
           if (tabs.length) {
             await chrome.tabs.reload(tabs[0].id);
             console.log('[Flow Agent] Refreshed existing Flow tab');
@@ -696,6 +709,8 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
     if (!shouldInject) throw error;
 
     // Inject content script and retry
+    const tab = await chrome.tabs.get(tabId);
+    if (!isFlowUrl(tab?.url)) throw new Error('INVALID_FLOW_TAB');
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['content.js'],
@@ -783,7 +798,7 @@ async function handleUploadVideo(msg) {
   const { videoBase64, projectId, videoSize } = params;
 
   try {
-    const tabs = await chrome.tabs.query({ url: '*://labs.google/*' });
+    const tabs = await chrome.tabs.query({ url: FLOW_TAB_URLS });
     if (!tabs.length) {
       sendToAgent({ id, error: 'NO_FLOW_TAB' });
       return;
@@ -1091,9 +1106,7 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   }
 
   if (msg.type === 'OPEN_FLOW_TAB') {
-    chrome.tabs.query({
-      url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-    }).then((tabs) => {
+    chrome.tabs.query({ url: FLOW_TAB_URLS }).then((tabs) => {
       if (tabs.length) {
         chrome.tabs.update(tabs[0].id, { active: true });
         reply({ ok: true, tabId: tabs[0].id });
