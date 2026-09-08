@@ -7,6 +7,29 @@
 
 importScripts('config.js');
 
+// Keep the last '[Flow Agent]' console lines in chrome.storage.local (debugLog)
+// so a stall can be diagnosed without the service-worker console, which is
+// gone by the time anyone looks.
+const DEBUG_LOG_MAX = 200;
+let _debugLog = [];
+let _debugLogFlush = null;
+for (const level of ['log', 'warn', 'error']) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => {
+    original(...args);
+    if (typeof args[0] !== 'string' || !args[0].startsWith('[Flow Agent]')) return;
+    const line = args.map((a) => (typeof a === 'string' ? a : (a?.message ?? JSON.stringify(a)))).join(' ');
+    _debugLog.push(`${new Date().toISOString()} ${level.toUpperCase()} ${line}`);
+    if (_debugLog.length > DEBUG_LOG_MAX) _debugLog = _debugLog.slice(-DEBUG_LOG_MAX);
+    if (!_debugLogFlush) {
+      _debugLogFlush = setTimeout(() => {
+        _debugLogFlush = null;
+        chrome.storage.local.set({ debugLog: _debugLog }).catch(() => {});
+      }, 250);
+    }
+  };
+}
+
 let callbackUrl = 'http://127.0.0.1:3001/api/ext/callback';
 // NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
 const API_KEY = 'AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY';
@@ -167,10 +190,73 @@ const FLOW_TAB_URLS = [
   'https://labs.google/fx/tools/flow*',
   'https://labs.google/fx/*/tools/flow*',
 ];
-const FLOW_URL = 'https://labs.google/fx/tools/flow';
+// labs.google/fx/tools/flow now 301s to the flow.google.com home page, which never
+// loads reCAPTCHA Enterprise — only /project/<id> pages do. Land there directly.
+const FLOW_URL = 'https://flow.google.com/';
 let workTabId = null;
 let flowTabOpening = null;
 let workTabCreatedByExtension = false;
+let lastFlowProjectUrl = null;
+
+chrome.storage.local.get(['lastFlowProjectUrl']).then((data) => {
+  if (!lastFlowProjectUrl && isFlowProjectUrl(data.lastFlowProjectUrl)) {
+    lastFlowProjectUrl = data.lastFlowProjectUrl;
+  }
+}).catch(() => {});
+
+// Remember the most recent project page any tab visits so an on-demand tab can
+// open somewhere captcha-capable even when the request carries no projectId.
+chrome.tabs.onUpdated.addListener((_, changeInfo) => {
+  if (changeInfo.url && isFlowProjectUrl(changeInfo.url)) {
+    lastFlowProjectUrl = changeInfo.url;
+    chrome.storage.local.set({ lastFlowProjectUrl }).catch(() => {});
+  }
+});
+
+function isFlowProjectUrl(url) {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' && parsed.hostname === 'flow.google.com'
+      && /^\/project\/[^/]+/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function flowTabTargetUrl(projectId) {
+  if (projectId) return `https://flow.google.com/project/${encodeURIComponent(projectId)}`;
+  return lastFlowProjectUrl || FLOW_URL;
+}
+
+// Google only sends the ya29 bearer while labs.google/fx/tools/flow hands off to
+// flow.google.com; reloading a flow.google.com page never surfaces it.
+const TOKEN_URL = 'https://labs.google/fx/tools/flow';
+
+// Drive a tab through the labs.google handoff so the webRequest listener can
+// capture a fresh bearer. Never navigates a tab the user opened.
+async function refreshTokenViaLabs() {
+  let tabId = null;
+  if (workTabId !== null && workTabCreatedByExtension) {
+    try {
+      await chrome.tabs.get(workTabId);
+      tabId = workTabId;
+    } catch {
+      workTabId = null;
+    }
+  }
+  if (tabId === null) {
+    const tab = await chrome.tabs.create({ url: TOKEN_URL, active: false });
+    workTabId = tab.id;
+    workTabCreatedByExtension = true;
+    tabId = tab.id;
+  } else {
+    await chrome.tabs.update(tabId, { url: TOKEN_URL });
+  }
+  await waitForTabComplete(tabId);
+  scheduleFlowTabClose();
+  return tabId;
+}
 
 function scheduleFlowTabClose() {
   if (workTabCreatedByExtension) {
@@ -222,34 +308,90 @@ async function waitForTabComplete(tabId, maxWaitMs = 10000) {
   });
 }
 
+// Every await on the tab-lookup path is bounded: one Chrome API call that never
+// settles would otherwise park getOrOpenFlowTab's shared promise forever and
+// silently stall every later request behind it.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}_TIMEOUT`)), ms);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
+// True only if content.js AND injected.js answer in this tab. A tab can match a
+// Flow URL yet have a dead bridge (opened before an extension reload, discarded,
+// or on a page that never loaded injected.js) — sending it GET_CAPTCHA then just
+// burns 25s and reports CONTENT_TIMEOUT.
+async function bridgeAlive(tabId) {
+  const ping = () => withTimeout(chrome.tabs.sendMessage(tabId, { type: 'PING_BRIDGE' }), 5000, 'PING');
+  try {
+    const resp = await ping();
+    if (resp?.ok) return true;
+  } catch { /* no content script yet — inject and retry below */ }
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!isFlowUrl(tab?.url)) return false;
+    await withTimeout(
+      chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }),
+      10000, 'INJECT',
+    );
+    await sleep(300);
+    const resp = await ping();
+    return !!resp?.ok;
+  } catch (e) {
+    console.warn('[Flow Agent] Bridge ping failed for tab', tabId, e.message);
+    return false;
+  }
+}
+
 // Finds/wakes/creates the Flow tab. Returns
 // the tab, or null if it couldn't be opened.
-async function _getOrOpenFlowTab() {
+async function _getOrOpenFlowTab(projectId) {
+  const targetUrl = flowTabTargetUrl(projectId);
+
   if (workTabId !== null) {
     try {
       let tab = await chrome.tabs.get(workTabId);
-      if (tab && !isFlowUrl(tab.url)) {
-        await chrome.tabs.update(workTabId, { url: FLOW_URL });
+      // Move our own tab onto a project page; a user's tab is only replaced
+      // when it has left Flow entirely.
+      const needsProjectPage = workTabCreatedByExtension && !isFlowProjectUrl(tab?.url);
+      if (tab && (!isFlowUrl(tab.url) || needsProjectPage)) {
+        await withTimeout(chrome.tabs.update(workTabId, { url: targetUrl }), 10000, 'TAB_UPDATE');
         await waitForTabComplete(workTabId);
         tab = await chrome.tabs.get(workTabId);
       }
-      scheduleFlowTabClose();
-      return tab;
+      if (await bridgeAlive(workTabId)) {
+        scheduleFlowTabClose();
+        return tab;
+      }
+      console.warn('[Flow Agent] Flow tab', workTabId, 'has a dead captcha bridge; looking for another');
+      workTabId = null;
     } catch (e) {
       workTabId = null; // closed by the user — fall through and open fresh
     }
   }
 
   const tabs = await chrome.tabs.query({ url: FLOW_TAB_URLS });
-  if (tabs.length) {
-    workTabId = tabs[0].id;
+  // Project pages first — they are the only ones that load reCAPTCHA.
+  const candidates = [...tabs.filter((t) => isFlowProjectUrl(t.url)), ...tabs.filter((t) => !isFlowProjectUrl(t.url))];
+  for (const tab of candidates) {
+    if (!(await bridgeAlive(tab.id))) continue;
+    if (!isFlowProjectUrl(tab.url)) {
+      console.warn('[Flow Agent] Flow tab is not on a /project/ page; reCAPTCHA is only available there');
+    }
+    workTabId = tab.id;
     workTabCreatedByExtension = false;
-    return tabs[0];
+    return tab;
+  }
+  if (tabs.length) {
+    console.warn('[Flow Agent] None of', tabs.length, 'Flow tab(s) answered the bridge ping; opening a fresh one');
   }
 
-  const createdTab = await chrome.tabs.create({ url: FLOW_URL, active: false });
+  const createdTab = await withTimeout(chrome.tabs.create({ url: targetUrl, active: false }), 10000, 'TAB_CREATE');
   workTabId = createdTab.id;
   workTabCreatedByExtension = true;
+  console.log('[Flow Agent] Opened Flow work tab', workTabId, 'at', targetUrl);
   await waitForTabComplete(workTabId);
   await sleep(1500);
 
@@ -257,10 +399,10 @@ async function _getOrOpenFlowTab() {
   try {
     const readyTab = await chrome.tabs.get(workTabId);
     if (!isFlowUrl(readyTab?.url)) throw new Error('INVALID_FLOW_TAB');
-    await chrome.scripting.executeScript({
+    await withTimeout(chrome.scripting.executeScript({
       target: { tabId: workTabId },
       files: ['content.js'],
-    });
+    }), 10000, 'INJECT');
   } catch (e) {
     console.warn('[Flow Agent] Content script pre-injection:', e.message);
   }
@@ -269,9 +411,13 @@ async function _getOrOpenFlowTab() {
   return createdTab;
 }
 
-async function getOrOpenFlowTab() {
+async function getOrOpenFlowTab(projectId) {
   if (flowTabOpening) return flowTabOpening;
-  flowTabOpening = _getOrOpenFlowTab();
+  flowTabOpening = withTimeout(_getOrOpenFlowTab(projectId), 60000, 'FLOW_TAB')
+    .catch((e) => {
+      console.error('[Flow Agent] getOrOpenFlowTab failed:', e.message);
+      return null;
+    });
   try {
     return await flowTabOpening;
   } finally {
@@ -300,16 +446,8 @@ async function captureTokenFromFlowTab() {
   }
   _openingFlowTab = true;
   try {
-    const tab = await getOrOpenFlowTab();
-    if (!tab) {
-      console.log('[Flow Agent] Flow tab not ready yet after open');
-      return;
-    }
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['content.js'],
-    });
-    console.log('[Flow Agent] Token refresh triggered on Flow tab');
+    const tabId = await refreshTokenViaLabs();
+    console.log('[Flow Agent] Token refresh triggered via labs.google handoff in tab', tabId);
   } catch (e) {
     console.error('[Flow Agent] Token refresh failed:', e);
   } finally {
@@ -410,14 +548,9 @@ async function connectToAgent() {
           sendToAgent({ type: 'token_captured', flowKey, clientId: extensionClientId });
         } else {
           console.log('[Flow Agent] open_flow_tab: token missing/expired, opening tab');
-          const tabs = await chrome.tabs.query({ url: FLOW_TAB_URLS });
-          if (tabs.length) {
-            await chrome.tabs.reload(tabs[0].id);
-            console.log('[Flow Agent] Refreshed existing Flow tab');
-          } else {
-            await chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow', active: true });
-            console.log('[Flow Agent] Opened new Flow tab');
-          }
+          // Reloading an existing flow.google.com tab never yields a bearer —
+          // only the labs.google handoff does.
+          await refreshTokenViaLabs();
           await sleep(5000);
           if (flowKey && ws?.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
@@ -643,6 +776,8 @@ async function deliverOnce(entry) {
         ...(callbackSecret ? { Authorization: `Bearer ${callbackSecret}` } : {}),
       },
       body: JSON.stringify({ ...entry.msg, session_id: extensionClientId }),
+      // A stalled delivery must not wedge flushOutbox (and every response behind it).
+      signal: AbortSignal.timeout(30000),
     });
     // Any HTTP reply means the backend is reachable and has taken the response
     // (ok:true = matched a request, ok:false = unknown id / already handled).
@@ -724,9 +859,10 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
   }
 }
 
-async function solveCaptcha(requestId, captchaAction) {
-  const tab = await getOrOpenFlowTab();
+async function solveCaptcha(requestId, captchaAction, projectId) {
+  const tab = await getOrOpenFlowTab(projectId);
   if (!tab) return { error: 'NO_FLOW_TAB' };
+  console.log('[Flow Agent] Solving captcha', captchaAction, 'in tab', tab.id, tab.url);
 
   try {
     const resp = await Promise.race([
@@ -741,7 +877,7 @@ async function solveCaptcha(requestId, captchaAction) {
 
 async function handleSolveCaptcha(msg) {
   const { id, params } = msg;
-  const result = await solveCaptcha(id, params?.captchaAction || 'VIDEO_GENERATION');
+  const result = await solveCaptcha(id, params?.captchaAction || 'VIDEO_GENERATION', params?.projectId);
 
   // Standalone captcha solve counts as captcha-consuming
   metrics.requestCount++;
@@ -881,7 +1017,8 @@ async function handleApiRequest(msg) {
     // Step 1: Solve captcha if needed
     let captchaToken = null;
     if (captchaAction) {
-      const captchaResult = await solveCaptcha(id, captchaAction);
+      const projectId = body?.clientContext?.projectId || body?.requests?.[0]?.clientContext?.projectId || null;
+      const captchaResult = await solveCaptcha(id, captchaAction, projectId);
       captchaToken = captchaResult?.token || null;
       if (!captchaToken) {
         // Cannot proceed without captcha — API will 403
@@ -926,13 +1063,23 @@ async function handleApiRequest(msg) {
     const fetchHeaders = { ...(headers || {}) };
     fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
 
-    // Step 4: Make the API call from browser context
-    const response = await fetch(url, {
-      method: method || 'POST',
-      headers: fetchHeaders,
-      credentials: 'include',
-      body: method === 'GET' ? undefined : JSON.stringify(finalBody),
-    });
+    // Step 4: Make the API call from browser context. Bound it: a stalled
+    // connection here otherwise leaves the agent waiting for its own timeout
+    // with no error ever reported.
+    const abort = new AbortController();
+    const abortTimer = setTimeout(() => abort.abort(), 120000);
+    let response;
+    try {
+      response = await fetch(url, {
+        method: method || 'POST',
+        headers: fetchHeaders,
+        credentials: 'include',
+        body: method === 'GET' ? undefined : JSON.stringify(finalBody),
+        signal: abort.signal,
+      });
+    } finally {
+      clearTimeout(abortTimer);
+    }
 
     let responseData;
     const responseText = await response.text();

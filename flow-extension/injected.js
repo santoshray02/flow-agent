@@ -33,13 +33,31 @@ window.fetch = async function (...args) {
 };
 
 
+// Liveness probe so background.js can tell a tab whose bridge actually answers
+// from one that merely matches a Flow URL (stale, discarded, or CSP-blocked).
+window.addEventListener('FLOW_AGENT_PING', ({ detail }) => {
+  window.dispatchEvent(new CustomEvent('FLOW_AGENT_PONG', {
+    detail: { requestId: detail?.requestId, grecaptcha: !!window.grecaptcha?.enterprise?.execute },
+  }));
+});
+
+// content.js re-dispatches GET_CAPTCHA until it hears back (this script may
+// not have loaded yet on the first dispatch), so ignore repeats for a request
+// that is already being solved.
+const _captchaInFlight = new Set();
+
 window.addEventListener('GET_CAPTCHA', async ({ detail }) => {
   const { requestId, pageAction } = detail;
+  if (_captchaInFlight.has(requestId)) return;
+  _captchaInFlight.add(requestId);
   try {
     await waitForGrecaptcha();
-    const token = await window.grecaptcha.enterprise.execute(SITE_KEY, {
-      action: pageAction,
-    });
+    // execute() can hang indefinitely (e.g. while Google is throttling);
+    // fail loudly instead of letting content.js report a bare CONTENT_TIMEOUT.
+    const token = await Promise.race([
+      window.grecaptcha.enterprise.execute(SITE_KEY, { action: pageAction }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('grecaptcha execute timeout')), 15000)),
+    ]);
     window.dispatchEvent(new CustomEvent('CAPTCHA_RESULT', {
       detail: { requestId, token },
     }));
@@ -47,6 +65,8 @@ window.addEventListener('GET_CAPTCHA', async ({ detail }) => {
     window.dispatchEvent(new CustomEvent('CAPTCHA_RESULT', {
       detail: { requestId, error: e.message },
     }));
+  } finally {
+    _captchaInFlight.delete(requestId);
   }
 });
 
