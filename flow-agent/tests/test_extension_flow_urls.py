@@ -66,3 +66,26 @@ def test_extension_verifies_captcha_bridge_before_using_a_tab():
     assert "_captchaInFlight" in injected
     assert "grecaptcha execute timeout" in injected
 
+
+
+def test_background_forgets_user_home_and_skips_non_project_candidates():
+    source = (EXTENSION_DIR / "background.js").read_text(encoding="utf-8")
+    reuse = source.split("async function _getOrOpenFlowTab(projectId) {", 1)[1].split(
+        "const tabs = await chrome.tabs.query", 1
+    )[0]
+    guard = "if (!workTabCreatedByExtension && !isFlowProjectUrl(tab?.url)) {"
+    assert guard in reuse
+    forgotten, owned = reuse.split(guard, 1)[1].split("} else {", 1)
+    assert "workTabId = null;" in forgotten
+    assert "console.warn(" in forgotten
+    assert "return tab;" not in forgotten
+    assert "chrome.tabs.update" not in forgotten
+    assert "const needsProjectPage = workTabCreatedByExtension && !isFlowProjectUrl(tab?.url);" in owned
+    assert "if (tab && needsProjectPage) {" in owned
+    assert owned.index("if (tab && needsProjectPage)") < owned.index("chrome.tabs.update")
+    candidates = source.split("for (const tab of candidates) {", 1)[1].split("if (tabs.length)", 1)[0]
+    assert "if (!isFlowProjectUrl(tab.url)) {" in candidates
+    skip = "if (isFlowProjectUrl(targetUrl)) continue;"
+    assert "console.warn(" in candidates
+    assert candidates.index(skip) < candidates.index("bridgeAlive(tab.id)") < candidates.index("workTabId = tab.id;")
+    assert "chrome.tabs.create({ url: targetUrl, active: false })" in source

@@ -353,20 +353,25 @@ async function _getOrOpenFlowTab(projectId) {
   if (workTabId !== null) {
     try {
       let tab = await chrome.tabs.get(workTabId);
-      // Move our own tab onto a project page; a user's tab is only replaced
-      // when it has left Flow entirely.
-      const needsProjectPage = workTabCreatedByExtension && !isFlowProjectUrl(tab?.url);
-      if (tab && (!isFlowUrl(tab.url) || needsProjectPage)) {
-        await withTimeout(chrome.tabs.update(workTabId, { url: targetUrl }), 10000, 'TAB_UPDATE');
-        await waitForTabComplete(workTabId);
-        tab = await chrome.tabs.get(workTabId);
+      // Never navigate or cache a user's non-project tab, even if its bridge
+      // answers. Home pages do not load reCAPTCHA.
+      if (!workTabCreatedByExtension && !isFlowProjectUrl(tab?.url)) {
+        console.warn('[Flow Agent] User work tab is not on a /project/ page; forgetting it');
+        workTabId = null;
+      } else {
+        const needsProjectPage = workTabCreatedByExtension && !isFlowProjectUrl(tab?.url);
+        if (tab && needsProjectPage) {
+          await withTimeout(chrome.tabs.update(workTabId, { url: targetUrl }), 10000, 'TAB_UPDATE');
+          await waitForTabComplete(workTabId);
+          tab = await chrome.tabs.get(workTabId);
+        }
+        if (await bridgeAlive(workTabId)) {
+          scheduleFlowTabClose();
+          return tab;
+        }
+        console.warn('[Flow Agent] Flow tab', workTabId, 'has a dead captcha bridge; looking for another');
+        workTabId = null;
       }
-      if (await bridgeAlive(workTabId)) {
-        scheduleFlowTabClose();
-        return tab;
-      }
-      console.warn('[Flow Agent] Flow tab', workTabId, 'has a dead captcha bridge; looking for another');
-      workTabId = null;
     } catch (e) {
       workTabId = null; // closed by the user — fall through and open fresh
     }
@@ -376,16 +381,17 @@ async function _getOrOpenFlowTab(projectId) {
   // Project pages first — they are the only ones that load reCAPTCHA.
   const candidates = [...tabs.filter((t) => isFlowProjectUrl(t.url)), ...tabs.filter((t) => !isFlowProjectUrl(t.url))];
   for (const tab of candidates) {
-    if (!(await bridgeAlive(tab.id))) continue;
     if (!isFlowProjectUrl(tab.url)) {
       console.warn('[Flow Agent] Flow tab is not on a /project/ page; reCAPTCHA is only available there');
+      if (isFlowProjectUrl(targetUrl)) continue;
     }
+    if (!(await bridgeAlive(tab.id))) continue;
     workTabId = tab.id;
     workTabCreatedByExtension = false;
     return tab;
   }
   if (tabs.length) {
-    console.warn('[Flow Agent] None of', tabs.length, 'Flow tab(s) answered the bridge ping; opening a fresh one');
+    console.warn('[Flow Agent] None of', tabs.length, 'eligible Flow tab(s) answered the bridge ping; opening a fresh one');
   }
 
   const createdTab = await withTimeout(chrome.tabs.create({ url: targetUrl, active: false }), 10000, 'TAB_CREATE');
